@@ -4,6 +4,7 @@ import {
 } from '@/mock/data'
 import { pathKm } from '@/utils/geo'
 import { useRoadblockStore } from '@/store/roadblock'
+import { useTransferStore } from '@/store/transfer' // 循环依赖：仅在动作内延迟调用取补给日
 
 // 新建派发后联动：让道路阻断模块即时复核（该 store 尚未注册时静默跳过）
 function notifyDispatchChanged() {
@@ -14,6 +15,14 @@ function notifyDispatchChanged() {
 
 // 灾情等级权重（统筹分配优先级：等级高者优先锁定库存）
 const SEV_WEIGHT = { red: 4, orange: 3, yellow: 2, blue: 1 }
+
+// 安置点当前补给日（转移安置模块未初始化时回落到第 1 日）
+// 补给派发与签收/退回回执按此日落账，供安置点按日核算消耗、跨日结转
+function shelterDay() {
+  try {
+    return Math.max(1, useTransferStore().supplyDay || 1)
+  } catch { return 1 }
+}
 
 // 折线路径估算里程与时长（直线 x 路网系数，演示用）
 export function pathMetrics(points) {
@@ -247,6 +256,7 @@ export const useCommandStore = defineStore('command', {
         type, typeLabel: RESOURCE_TYPES[type].label, qty, unit: RESOURCE_TYPES[type].unit,
         distance: path.distance, minutes: path.minutes, at: nowStr(),
         color: '#26a69a', source: '安置补给',
+        day: shelterDay(), // 按日补给：派发所属补给日（在途物资跨日结转）
         status: 'enroute', via: [], detourBy: null, holdBy: null,
         // 派发闭环字段（同事件派发）
         signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
@@ -284,7 +294,11 @@ export const useCommandStore = defineStore('command', {
       if (qty > 0) {
         rec.signedQty = parts.received + qty
         if (!Array.isArray(rec.signLogs)) rec.signLogs = [] // 兼容无闭环字段的旧记录
-        rec.signLogs.push({ at, qty, receiver: (receiver || '').trim() || '现场签收员' })
+        rec.signLogs.push({
+          at, qty, receiver: (receiver || '').trim() || '现场签收员',
+          // 安置点补给按签收日落账（跨日在途签收计入当日到货）；事件派发无需按日
+          day: rec.shelterId ? shelterDay() : (rec.day || 1)
+        })
       }
       if (shortQty > 0) rec.shortQty = parts.shortage + shortQty
       const left = dispatchParts(rec).outstanding
@@ -330,6 +344,7 @@ export const useCommandStore = defineStore('command', {
           type: rec.type, typeLabel: rec.typeLabel, qty: take, unit: rec.unit,
           distance: c.path.distance, minutes: c.path.minutes, at: nowStr(),
           color: rec.color, source,
+          day: rec.shelterId ? shelterDay() : (rec.day || 1), // 安置点短缺补派按当日落账
           status: 'enroute', via: [], detourBy: null, holdBy: null,
           signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
           signLogs: [], returnLogs: [], withdrawLogs: [], replenishOf: rec.id
@@ -371,7 +386,13 @@ export const useCommandStore = defineStore('command', {
       if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + qty
       rec.returnedQty = parts.returned + qty
       if (!Array.isArray(rec.returnLogs)) rec.returnLogs = [] // 兼容旧记录
-      rec.returnLogs.push({ at: nowStr(), qty, reason: (reason || '').trim() || '现场退回' })
+      // 本动作仅退回「在途余量」（qty 不得超过 outstanding，已签收部分不在此列），
+      // 物资从未到达安置点：耐用品在位资产不因此减少（fromReceived 恒 0，留作扩展口径）
+      rec.returnLogs.push({
+        at: nowStr(), qty, reason: (reason || '').trim() || '现场退回',
+        day: rec.shelterId ? shelterDay() : (rec.day || 1),
+        fromReceived: 0
+      })
       const left = dispatchParts(rec).outstanding
       if (left === 0) {
         rec.status = 'done'

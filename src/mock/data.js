@@ -24,14 +24,24 @@ export const EVENT_STATUS = [
 ]
 
 // 资源类型
+// kind 分账：consumable 消耗品（按入住人·日逐日消耗）/ durable 耐用品（在位复用、随入住配发、转出退回）
 export const RESOURCE_TYPES = {
-  personnel: { label: '救援人员', unit: '人', icon: '👷' },
-  medical: { label: '医疗物资', unit: '件', icon: '💊' },
-  food: { label: '应急食品', unit: '份', icon: '🥫' },
-  water: { label: '饮用水', unit: '箱', icon: '💧' },
-  vehicle: { label: '救援车辆', unit: '辆', icon: '🚒' },
-  tent: { label: '帐篷', unit: '顶', icon: '⛺' }
+  personnel: { label: '救援人员', unit: '人', icon: '👷', kind: 'resource' },
+  medical: { label: '医疗物资', unit: '件', icon: '💊', kind: 'consumable' },
+  food: { label: '应急食品', unit: '份', icon: '🥫', kind: 'consumable' },
+  water: { label: '饮用水', unit: '箱', icon: '💧', kind: 'consumable' },
+  vehicle: { label: '救援车辆', unit: '辆', icon: '🚒', kind: 'resource' },
+  tent: { label: '帐篷', unit: '顶', icon: '⛺', kind: 'durable' }
 }
+
+// 安置点补给分账类别
+export const SUPPLY_KINDS = {
+  consumable: { label: '消耗品', hint: '按入住人·日逐日消耗，缺口跨日结转' },
+  durable: { label: '耐用品', hint: '在位复用：入住配发、转出回收，按在住峰值补足' }
+}
+
+// 模拟补给日锚点（第 1 日的日历日期，推进补给日时据此推算）
+export const SIM_DAY_ANCHOR = '2026-09-22'
 
 // 转移批次状态机：待接运 → 接运中 → 已安置 → 已转出（办结）
 export const TRANSFER_STATUS = [
@@ -57,13 +67,18 @@ export const SHELTERS = [
   { id: 'sh-5', name: '成都高新应急避难所', lng: 104.06, lat: 30.58, capacity: 1500 }
 ]
 
-// 安置点人均每日物资需求系数（按在住人数折算物资需求）
-export const SUPPLY_PER_CAPITA = {
+// 安置点人均物资需求系数（按在住人数折算一次性配发/保有需求）
+// 消耗品：按入住人·日消耗（SUPPLY_DAILY_COEF）；耐用品：人均保有量（SUPPLY_DURABLE_COEF）
+export const SUPPLY_DAILY_COEF = {
   food: 0.6,    // 份/人·日（两餐+加餐折算）
   water: 0.2,   // 箱/人·日
-  tent: 0.25,   // 顶/人（约 4 人一顶）
   medical: 0.05 // 件/人·日
 }
+export const SUPPLY_DURABLE_COEF = {
+  tent: 0.25    // 顶/人（约 4 人一顶），在位复用、转出回收
+}
+// 兼容旧引用
+export const SUPPLY_PER_CAPITA = { ...SUPPLY_DAILY_COEF, ...SUPPLY_DURABLE_COEF }
 
 // 城市坐标（作为 mock 场景锚点，实际为演示用经纬度）
 export const CITIES = {

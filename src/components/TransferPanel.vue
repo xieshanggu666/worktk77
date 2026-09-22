@@ -258,36 +258,112 @@
       <div class="sh-summary">
         在住 <b>{{ transfer.stats.housed }}</b> 人 · 在途 <b>{{ transfer.stats.inTransit }}</b> 人 · 累计转出 <b>{{ transfer.stats.out }}</b> 人
       </div>
+
+      <!-- 补给日历：按日核算消耗 / 跨日结转库存与在途 -->
+      <div class="day-bar">
+        <button class="day-nav" :disabled="transfer.supplyDay <= 1" @click="transfer.setSupplyDay(transfer.supplyDay - 1)">◀ 上一日</button>
+        <div class="day-now">
+          <strong>第 {{ transfer.supplyDay }} 补给日</strong>
+          <em>{{ dayDateLabel(transfer.supplyDay) }}</em>
+        </div>
+        <button class="day-nav" @click="transfer.advanceSupplyDay(1)">下一日 ▶</button>
+      </div>
+      <p class="day-hint">
+        消耗品按实际入住人·日核算、历史缺口与结余库存跨日结转；耐用品（帐篷）在位复用、转出退回不重复补；
+        在途物资跨日预占缺口，签收日转为当日到货
+      </p>
+
       <div v-for="item in transfer.shelterNeeds" :key="item.shelter.id" class="sh-card">
         <div class="sh-head">
           <strong>🏕️ {{ item.shelter.name }}</strong>
-          <span class="sh-occ">{{ item.occ }}/{{ item.shelter.capacity }}</span>
+          <span class="sh-occ">日终在住 {{ item.occEnd }}/{{ item.shelter.capacity }}</span>
         </div>
         <div class="sh-bar">
-          <i class="in" :style="{ width: Math.min(100, (item.occ / item.shelter.capacity) * 100) + '%' }"></i>
+          <i class="in" :style="{ width: Math.min(100, (item.occEnd / item.shelter.capacity) * 100) + '%' }"></i>
           <i class="rsv" :style="reservedStyle(item.shelter)"></i>
         </div>
         <p class="sh-sub">
-          在住 {{ item.occ }} · 批次预占 {{ bedOf(item.shelter.id).reserved }} · 余 {{ bedOf(item.shelter.id).left }} 床
+          当日在住人·日 {{ item.occ }} · 批次预占 {{ bedOf(item.shelter.id).reserved }} · 余 {{ bedOf(item.shelter.id).left }} 床
         </p>
-        <div class="sh-needs">
-          <template v-if="Object.keys(item.gap).length">
-            <span class="need-tag" v-for="(q, t) in item.gap" :key="t">缺 {{ resIcon(t) }}{{ resLabel(t) }} {{ q }}{{ resUnit(t) }}</span>
-          </template>
-          <span v-else class="need-ok">✅ 物资充足</span>
+
+        <!-- 消耗品：按日消耗 + 跨日结转 -->
+        <div class="kind-group">
+          <p class="kind-title">🍚 消耗品（按入住人·日）</p>
+          <div class="sh-needs">
+            <template v-for="x in consItems(item)" :key="x.t">
+              <span v-if="x.v.gap > 0" class="need-tag">
+                缺 {{ resIcon(x.t) }}{{ resLabel(x.t) }} {{ x.v.gap }}{{ resUnit(x.t) }}
+                <em v-if="x.v.backlogBefore > 0">（含历史缺口 {{ x.v.backlogBefore }}）</em>
+              </span>
+              <span v-else class="need-ok">{{ resIcon(x.t) }} 已覆盖</span>
+            </template>
+          </div>
+          <p class="sh-sent" v-if="consItems(item).some((x) => x.v.sent > 0)">
+            已保障（实收+在途）：
+            <span v-for="x in consItems(item).filter((y) => y.v.sent > 0)" :key="x.t">
+              {{ resIcon(x.t) }}{{ x.v.sent }}{{ resUnit(x.t) }}
+              <em>（在途{{ x.v.inTransit }}·结存{{ x.v.carry }}）</em>
+            </span>
+          </p>
         </div>
-        <p class="sh-sent" v-if="Object.keys(item.sent).length">
-          已保障（实收+在途）：<span v-for="(q, t) in item.sent" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
-        </p>
-        <p class="sh-recv" v-if="Object.keys(item.received).length">
-          📥 实际签收：<span v-for="(q, t) in item.received" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
-        </p>
+
+        <!-- 耐用品：在位保有，转出退回复用 -->
+        <div class="kind-group">
+          <p class="kind-title">⛺ 耐用品（在位复用）</p>
+          <div class="sh-needs">
+            <template v-for="x in durableItems(item)" :key="x.t">
+              <span v-if="x.v.gap > 0" class="need-tag">
+                缺 {{ resIcon(x.t) }}{{ resLabel(x.t) }} {{ x.v.gap }}{{ resUnit(x.t) }}
+                <em>（需 {{ x.v.todayDemand }}·在途 {{ x.v.inTransit }}）</em>
+              </span>
+              <span v-else class="need-ok">{{ resIcon(x.t) }} 在位 {{ x.v.onHand }} 够用</span>
+            </template>
+          </div>
+          <p class="sh-sent" v-if="durableItems(item).some((x) => x.v.received > 0 || x.v.returned > 0)">
+            资产账：
+            <span v-for="x in durableItems(item).filter((y) => y.v.received > 0 || y.v.returned > 0)" :key="x.t">
+              {{ resIcon(x.t) }}累计领 {{ x.v.received }} · 退回 {{ x.v.returned }} · 在位 <b>{{ x.v.onHand }}</b>{{ resUnit(x.t) }}
+            </span>
+          </p>
+        </div>
+
         <button class="supply-btn" :disabled="!Object.keys(item.gap).length" @click="onSupply(item.shelter.id)">
-          📦 一键补给（就近调拨）
+          📦 一键补给（按当日净缺口就近调拨）
         </button>
         <p v-if="supplyMsg[item.shelter.id]" class="msg" :class="supplyMsg[item.shelter.id].ok ? 'ok' : 'err'">
           {{ supplyMsg[item.shelter.id].msg }}
         </p>
+
+        <!-- 按日台账：跨日结转明细 -->
+        <div class="ledger-toggle" @click="toggleLedger(item.shelter.id)">
+          {{ ledgerOpen[item.shelter.id] ? '▾' : '▸' }} 按日补给台账（第 1-{{ transfer.supplyDay }} 日）
+        </div>
+        <table v-if="ledgerOpen[item.shelter.id]" class="day-ledger">
+          <thead>
+            <tr><th>日期</th><th v-for="t in item.types" :key="t">{{ resIcon(t) }}{{ resLabel(t) }}</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in ledgerRows(item.shelter.id)" :key="row.day">
+              <td class="dl-date">第{{ row.day }}日<em>{{ row.date }}</em></td>
+              <td v-for="t in item.types" :key="t">
+                <template v-if="row.types[t].kind === 'consumable'">
+                  需{{ row.types[t].demand }}<br />
+                  <i :class="{ bad: row.types[t].backlog > 0 }">
+                    缺{{ row.types[t].day === transfer.supplyDay ? row.types[t].gap : row.types[t].backlog }}
+                  </i>
+                  ·存{{ row.types[t].carry }}
+                  <em v-if="row.types[t].inTransit > 0">·途{{ row.types[t].inTransit }}</em>
+                </template>
+                <template v-else-if="row.types[t].demand != null">
+                  在{{ row.types[t].occ }}·需{{ row.types[t].demand }}<br />
+                  <i :class="{ bad: row.types[t].shortage > 0 }">缺{{ row.types[t].shortage }}</i>
+                  ·在位{{ row.types[t].onHand }}
+                </template>
+                <template v-else><span class="dl-na">—</span></template>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </template>
   </div>
@@ -296,7 +372,7 @@
 <script setup>
 import { ref, computed, reactive, watch } from 'vue'
 import { useCommandStore, roughPath } from '@/store/command'
-import { useTransferStore } from '@/store/transfer'
+import { useTransferStore, supplyDateLabel } from '@/store/transfer'
 import { RESOURCE_TYPES, REGISTER_STAGES, TRANSFER_STATUS } from '@/mock/data'
 
 const cmd = useCommandStore()
@@ -337,6 +413,16 @@ const settlePct = computed(() => {
 })
 
 const bedOf = (id) => transfer.bedMap[id] || { inHouse: 0, reserved: 0, left: 0 }
+// 耐用品 / 消耗品分账分组
+const consItems = (item) =>
+  item.types.map((t) => ({ t, v: item.ledger[t] })).filter((x) => x.v.kind === 'consumable')
+const durableItems = (item) =>
+  item.types.map((t) => ({ t, v: item.ledger[t] })).filter((x) => x.v.kind === 'durable')
+const dayDateLabel = (d) => supplyDateLabel(d)
+// 按日台账（默认收起）
+const ledgerOpen = reactive({})
+const toggleLedger = (id) => { ledgerOpen[id] = !ledgerOpen[id] }
+const ledgerRows = (shelterId) => transfer.shelterLedgers[shelterId] || []
 const baseName = (id) => cmd.bases.find((b) => b.id === id)?.name || '—'
 const shelterName = (id) => transfer.shelters.find((s) => s.id === id)?.name || '—'
 const statusLabel = (s) => TRANSFER_STATUS.find((x) => x.value === s)?.label || s
@@ -506,7 +592,11 @@ function onCancel(b) {
 function onSupply(shelterId) {
   const r = transfer.autoSupply(shelterId)
   supplyMsg[shelterId] = r.ok
-    ? { ok: true, msg: `已生成 ${r.sent.length} 条补给派发${r.unmet.length ? `，${r.unmet.length} 类物资仍有缺口` : ''}` }
+    ? {
+        ok: true,
+        msg: `第${transfer.supplyDay}补给日已生成 ${r.sent.length} 条补给派发`
+          + (r.unmet.length ? `，${r.unmet.map((x) => resLabel(x.type) + x.qty).join('、')} 库存不足缺口已跨日结转` : '')
+      }
     : { ok: false, msg: r.msg }
 }
 </script>
@@ -681,6 +771,48 @@ function onSupply(shelterId) {
   border-radius: 8px; padding: 8px 10px; font-size: 11px; color: #8ba2c8;
 }
 .sh-summary b { color: #7ef0c9; }
+
+/* 补给日历 */
+.day-bar {
+  display: flex; align-items: center; gap: 8px;
+  background: #101d39; border: 1px solid rgba(120,160,220,0.2);
+  border-radius: 9px; padding: 7px 10px;
+}
+.day-nav {
+  background: #0c1730; border: 1px solid rgba(120,160,220,0.3);
+  color: #8ba2c8; font-size: 11px; border-radius: 6px; padding: 5px 10px; cursor: pointer;
+}
+.day-nav:hover:not(:disabled) { color: #fff; border-color: #26a69a; }
+.day-nav:disabled { opacity: 0.4; cursor: not-allowed; }
+.day-now { flex: 1; text-align: center; display: flex; flex-direction: column; gap: 1px; }
+.day-now strong { font-size: 12px; color: #7ef0c9; }
+.day-now em { font-style: normal; font-size: 10px; color: #5b6f94; }
+.day-hint { font-size: 9px; color: #5b6f94; line-height: 1.5; margin: 0; }
+
+.kind-group { margin-top: 7px; }
+.kind-title { font-size: 10px; color: #6f8cb8; font-weight: 700; margin: 0 0 3px; }
+.kind-group .sh-needs { margin-top: 2px; }
+.need-tag em { font-style: normal; opacity: 0.75; }
+.sh-sent em { font-style: normal; color: #5b6f94; }
+.sh-sent b { color: #7ef0c9; }
+
+/* 按日台账 */
+.ledger-toggle {
+  margin-top: 7px; font-size: 10px; color: #6f8cb8; cursor: pointer; user-select: none;
+}
+.ledger-toggle:hover { color: #8ba2c8; }
+.day-ledger {
+  width: 100%; margin-top: 4px; border-collapse: collapse; font-size: 9px; color: #8ba2c8;
+}
+.day-ledger th, .day-ledger td {
+  border: 1px solid rgba(120,160,220,0.12); padding: 3px 5px; text-align: left; vertical-align: top;
+  white-space: nowrap;
+}
+.day-ledger th { background: #0c1730; color: #6f8cb8; font-weight: 600; }
+.day-ledger .dl-date em { display: block; font-style: normal; color: #5b6f94; font-size: 8px; }
+.day-ledger i { font-style: normal; }
+.day-ledger i.bad { color: #ef9a9a; }
+.day-ledger .dl-na { color: #4a5875; }
 .sh-card {
   background: rgba(16,29,57,0.6); border: 1px solid rgba(120,160,220,0.12);
   border-radius: 9px; padding: 9px 10px;

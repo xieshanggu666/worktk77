@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia'
 import { useCommandStore, roughPath, pathMetrics, dispatchParts } from '@/store/command'
 import { useRoadblockStore } from '@/store/roadblock'
-import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
+import {
+  SHELTERS, SUPPLY_DAILY_COEF, SUPPLY_DURABLE_COEF, SIM_DAY_ANCHOR
+} from '@/mock/data'
 
 let batchSeq = 0
 let personSeq = 0
@@ -10,10 +12,84 @@ const nowStr = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', m
 // 人员查重键：优先证件号，无证件号用姓名
 const personKey = (p) => (p.idNo && p.idNo.trim()) ? 'id:' + p.idNo.trim() : 'nm:' + (p.name || '').trim()
 
+// 补给日历：第 1 日锚点 +（day-1）天
+export function supplyDateLabel(day) {
+  const d = new Date(SIM_DAY_ANCHOR + 'T00:00:00')
+  d.setDate(d.getDate() + Math.max(0, day - 1))
+  return `${d.getMonth() + 1}月${d.getDate()}日`
+}
+// 取记录/回执所属补给日（兼容无日期字段的历史记录：按第 1 日处理）
+const recDay = (r) => (Number.isFinite(r?.day) ? r.day : 1)
+const logDay = (log, fallback) => (Number.isFinite(log?.day) ? log.day : fallback)
+
+/* ---------- 入住时段 → 每日在住口径（按实际入住/转出日期核算） ---------- */
+// 人员在 d 日的入住时段（入住日 ci、转出日 co 均计消耗，含当日入住又转出）：
+// [ci, co] 闭区间——入住日与转出日都按全天在住核算每日消耗
+function personDaysOn(members, day) {
+  let n = 0
+  members.forEach((m) => {
+    if (!m.checkinAt) return
+    const ci = m.checkinDay || 1
+    if (!m.checkoutAt) { if (ci <= day) n++ }
+    else {
+      const co = m.checkoutDay || ci
+      if (ci <= day && day <= co) n++
+    }
+  })
+  return n
+}
+// 日终在住口径（用于耐用品保有需求与床位/在住展示）：
+// 已入住、且在 d 日日终尚未转出即在册；无日期字段的历史登记按第 1 日兼容
+function occEndOf(members, day) {
+  let n = 0
+  members.forEach((m) => {
+    if (!m.checkinAt) return
+    const ci = m.checkinDay || 1
+    if (ci > day) return
+    // 转出日当日日终已不在册（转出日的白天消耗仍由 personDaysOn 计 1 人·日）
+    if (m.checkoutAt && (m.checkoutDay || ci) <= day) return
+    n++
+  })
+  return n
+}
+// 安置点全部批次（含已办结，历史入住时段仍参与跨日核算）的成员
+function shelterMembers(state, shelterId) {
+  const list = []
+  state.batches.forEach((b) => { if (b.shelterId === shelterId) list.push(...b.members) })
+  return list
+}
+
+// 按类型汇总安置点物资账（实收按签收日、退回按退回日归集；在途仅计未闭环余量）
+function shelterMaterial(records, shelterId, type, today) {
+  const recvByDay = {}, retByDay = {}, retFromRecvByDay = {}
+  let received = 0, returned = 0, returnedFromReceived = 0, inTransit = 0, held = 0
+  records.forEach((d) => {
+    if (d.shelterId !== shelterId || d.type !== type) return
+    const p = dispatchParts(d)
+    received += p.received
+    returned += p.returned
+    inTransit += p.inTransit
+    held += p.heldQty
+    ;(d.signLogs || []).forEach((l) => {
+      const dy = logDay(l, recDay(d))
+      recvByDay[dy] = (recvByDay[dy] || 0) + (l.qty || 0)
+    })
+    ;(d.returnLogs || []).forEach((l) => {
+      const dy = logDay(l, recDay(d))
+      const fromR = l.fromReceived != null ? l.fromReceived : 0 // 旧记录无标记按在途退回
+      retByDay[dy] = (retByDay[dy] || 0) + (l.qty || 0)
+      retFromRecvByDay[dy] = (retFromRecvByDay[dy] || 0) + fromR
+      returnedFromReceived += fromR
+    })
+  })
+  return { recvByDay, retByDay, retFromRecvByDay, received, returned, returnedFromReceived, inTransit, held, today }
+}
+
 export const useTransferStore = defineStore('transfer', {
   state: () => ({
-    shelters: [],   // 安置点（床位容量）
-    batches: []     // 转移批次
+    shelters: [],    // 安置点（床位容量）
+    batches: [],     // 转移批次
+    supplyDay: 1     // 当前补给日（按日核算消耗、跨日结转库存与在途物资）
   }),
 
   getters: {
@@ -35,29 +111,165 @@ export const useTransferStore = defineStore('transfer', {
       Object.values(m).forEach((v) => { v.left = Math.max(0, v.left - v.inHouse - v.reserved) })
       return m
     },
-    /* ---------- 安置点物资需求（在住人数 × 人均系数 - 已补给） ---------- */
+    /* ---------- 安置点按日补给核算 ----------
+     * 消耗品：按实际入住时段核算每人·日消耗，历史日缺口跨日结转（新到货优先冲抵旧缺口），
+     *         跨日结余库存照转；在途物资对当日缺口做预占，签收后才转为实际库存；
+     * 耐用品：按日终在住 × 人均保有量补足，在位资产 = 累计实收 − 已签收库存退回，
+     *         转出退实物即释放给新入住人员复用，不重复补给；在途余量退回从未到货、不冲减在位；
+     * 人员转出 / 分批签收 / 短缺认定补派 / 退回均实时重算；无日期字段的历史派发按第 1 日兼容。 */
     shelterNeeds(state) {
       const cmd = useCommandStore()
+      const day = state.supplyDay
       return state.shelters.map((s) => {
-        const occ = this.bedMap[s.id]?.inHouse || 0
-        const need = {}
-        Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => { need[t] = Math.ceil(occ * coef) })
-        const sent = {}
-        const received = {}
-        cmd.dispatches.forEach((d) => {
-          if (d.shelterId !== s.id) return
-          const p = dispatchParts(d)
-          const cover = p.received + p.inTransit
-          if (cover > 0) sent[d.type] = (sent[d.type] || 0) + cover
-          if (p.received > 0) received[d.type] = (received[d.type] || 0) + p.received
+        const members = shelterMembers(state, s.id)
+        const occToday = personDaysOn(members, day)
+
+        // 消耗品：逐人·日需求，按 缺口结转 + 库存结转 双轨滚动核算
+        const cons = {}
+        Object.entries(SUPPLY_DAILY_COEF).forEach(([t, coef]) => {
+          const ac = shelterMaterial(cmd.dispatches, s.id, t, day)
+          let cumDemand = 0, cumRecv = 0
+          let backlog = 0, carry = 0 // 上一日结转：待补缺口 / 结余库存（仅按已签收到货滚动）
+          const daily = {}
+          for (let d = 1; d <= day; d++) {
+            const demand = Math.ceil(personDaysOn(members, d) * coef)
+            const recv = ac.recvByDay[d] || 0
+            const ret = ac.retByDay[d] || 0
+            // 历史缺口先吃结转库存与当日到货，余量才进结余；在途物资未签收不进库存
+            const applied = carry + recv
+            const totalNeed = backlog + demand
+            backlog = Math.max(0, totalNeed - applied)
+            carry = Math.max(0, applied - totalNeed)
+            // 当日在途量只对当日待补缺口做预占（不进跨日结余）
+            const gapD = d === day ? Math.max(0, backlog - ac.inTransit) : backlog
+            daily[d] = {
+              occ: personDaysOn(members, d), demand, recv, ret,
+              backlog, carry, gap: gapD, inTransit: d === day ? ac.inTransit : 0
+            }
+            cumDemand += demand
+            cumRecv += recv
+          }
+          cons[t] = {
+            kind: 'consumable',
+            coef,
+            cumDemand,
+            todayDemand: daily[day].demand,
+            occToday,
+            received: cumRecv,
+            inTransit: ac.inTransit,
+            held: ac.held,
+            returned: ac.returned,
+            sent: cumRecv + ac.inTransit, // 保障量（实收+在途，沿用闭环口径）
+            carry,                        // 跨日结转结余库存（仅按实收滚动）
+            backlog,                      // 按实收口径滚动的累计待补缺口（未含当日在途预占）
+            backlogBefore: day > 1 ? daily[day - 1].backlog : 0, // 截至昨日的历史缺口
+            gap: daily[day].gap,          // 当日净缺口（已预占在途）
+            daily
+          }
         })
-        const gap = {}
-        Object.entries(need).forEach(([t, n]) => {
-          const g = n - (sent[t] || 0)
-          if (g > 0) gap[t] = g
+
+        // 耐用品：按日终在住保有；在位资产 = 累计实收 - 已签收库存退回
+        //   （在途余量从未到货，其退回不冲减在位；转出人员的实物退回即释放复用，不重复补）
+        const durable = {}
+        Object.entries(SUPPLY_DURABLE_COEF).forEach(([t, coef]) => {
+          const ac = shelterMaterial(cmd.dispatches, s.id, t, day)
+          let peak = 0
+          for (let d = 1; d <= day; d++) peak = Math.max(peak, occEndOf(members, d))
+          const occEnd = occEndOf(members, day)
+          const need = Math.ceil(occEnd * coef)
+          const peakNeed = Math.ceil(peak * coef)
+          const onHand = ac.received - ac.returnedFromReceived
+          const gap = Math.max(0, need - onHand - ac.inTransit)
+          durable[t] = {
+            kind: 'durable',
+            coef,
+            cumDemand: peakNeed,
+            todayDemand: need,
+            occToday: occEnd,
+            received: ac.received,
+            inTransit: ac.inTransit,
+            held: ac.held,
+            returned: ac.returned,
+            returnedFromReceived: ac.returnedFromReceived,
+            sent: onHand + ac.inTransit,
+            onHand,
+            peak, peakNeed,
+            gap,
+            daily: null
+          }
         })
-        return { shelter: s, occ, need, sent, received, gap }
+
+        const ledger = { ...cons, ...durable }
+
+        // 汇总口径（兼容原 shelterNeeds 消费方：need/sent/received/gap）
+        const need = {}, sent = {}, received = {}, gap = {}
+        Object.entries(ledger).forEach(([t, x]) => {
+          need[t] = x.todayDemand
+          if (x.sent > 0) sent[t] = x.sent
+          if (x.received > 0) received[t] = x.received
+          if (x.gap > 0) gap[t] = x.gap
+        })
+
+        return {
+          shelter: s,
+          occ: occToday,
+          occEnd: occEndOf(members, day),
+          need, sent, received, gap,
+          ledger,
+          types: Object.keys(ledger)
+        }
       })
+    },
+
+    // 按日台账（第 1 日..当前补给日：在住人·日 / 需求 / 到货 / 退回 / 待补缺口 / 结转结余）
+    shelterLedgers(state) {
+      const cmd = useCommandStore()
+      const m = {}
+      this.shelterNeeds.forEach((item) => {
+        const sId = item.shelter.id
+        const members = shelterMembers(state, sId)
+        // 耐用品按日累计实收/退回（回执日落账），还原每个历史日的在位资产
+        const durByDay = {}
+        Object.entries(SUPPLY_DURABLE_COEF).forEach(([t]) => {
+          const rec = [], ret = []
+          cmd.dispatches.forEach((d) => {
+            if (d.shelterId !== sId || d.type !== t) return
+            ;(d.signLogs || []).forEach((l) => { rec.push({ day: logDay(l, recDay(d)), qty: l.qty || 0 }) })
+            ;(d.returnLogs || []).forEach((l) => {
+              // 仅已签收库存退回冲减在位；在途余量退回不计
+              ret.push({ day: logDay(l, recDay(d)), qty: l.fromReceived != null ? l.fromReceived : 0 })
+            })
+          })
+          durByDay[t] = {
+            recUpTo: (d) => rec.filter((x) => x.day <= d).reduce((sum, x) => sum + x.qty, 0),
+            retUpTo: (d) => ret.filter((x) => x.day <= d).reduce((sum, x) => sum + x.qty, 0)
+          }
+        })
+        const rows = []
+        for (let d = 1; d <= state.supplyDay; d++) {
+          const row = { day: d, date: supplyDateLabel(d), types: {} }
+          Object.entries(item.ledger).forEach(([t, x]) => {
+            if (x.kind === 'consumable') {
+              row.types[t] = { ...x.daily[d], kind: 'consumable' }
+            } else {
+              const occ = occEndOf(members, d)
+              const demand = Math.ceil(occ * x.coef)
+              const recv = durByDay[t].recUpTo(d)
+              const rtn = durByDay[t].retUpTo(d)
+              const onHand = recv - rtn
+              // 历史日在途无法回溯（签收后才落账），台账展示按 在位资产 vs 需求 的净缺口
+              const inTransit = d === state.supplyDay ? x.inTransit : 0
+              row.types[t] = {
+                kind: 'durable', occ, demand, recv, ret: rtn, onHand,
+                inTransit, shortage: Math.max(0, demand - onHand - inTransit)
+              }
+            }
+          })
+          rows.push(row)
+        }
+        m[sId] = rows
+      })
+      return m
     },
     /* ---------- 事件转移进度（回写事件详情） ---------- */
     // eventId -> { batches, planned, picked, checkedIn, out }
@@ -97,6 +309,7 @@ export const useTransferStore = defineStore('transfer', {
     load() {
       this.shelters = SHELTERS.map((s) => ({ ...s }))
       this.batches = []
+      this.supplyDay = 1
     },
 
     _cmd() { return useCommandStore() },
@@ -358,13 +571,17 @@ export const useTransferStore = defineStore('transfer', {
       if (avail < members.length) {
         return { ok: false, msg: `${this.shelters.find((s) => s.id === b.shelterId)?.name} 剩余床位 ${avail}，不足 ${members.length} 人，请改派安置点` }
       }
-      members.forEach((m) => { m.checkinAt = nowStr() })
+      members.forEach((m) => { m.checkinAt = nowStr(); m.checkinDay = this.supplyDay })
       this._afterRegister(b, 'checkin', `🏕️ 入住登记 ${members.length} 人 → ${this.shelters.find((s) => s.id === b.shelterId)?.name}`)
       return { ok: true, msg: `已入住 ${members.length} 人` }
     },
 
     _checkout(b, members) {
-      members.forEach((m) => { m.checkoutAt = nowStr() })
+      members.forEach((m) => {
+        m.checkoutAt = nowStr()
+        // 转出落账当前补给日；入住当日转出仍计当日 1 人·日（由 personDaysOn 处理）
+        m.checkoutDay = Math.max(m.checkinDay || this.supplyDay, this.supplyDay)
+      })
       this._afterRegister(b, 'checkout', `🚪 转出登记 ${members.length} 人（返乡/投亲/转院）`)
       return { ok: true, msg: `已转出 ${members.length} 人` }
     },
@@ -517,13 +734,26 @@ export const useTransferStore = defineStore('transfer', {
 
     /* ---------- 安置点物资联动 ---------- */
 
-    // 一键补给：按缺口就近调拨（预占式演算，直接生成补给派发记录）
+    // 补给日推进 / 回退（演示用时间轴）：
+    // 推进日不改动库存与在途账目——消耗、缺口与结转全部由 shelterNeeds 按实际入住时段重算，
+    // 在途物资自动带入新一日继续预占缺口，历史日缺口滚动结转。
+    setSupplyDay(day) {
+      day = Math.max(1, Math.round(day || 1))
+      this.supplyDay = day
+    },
+    advanceSupplyDay(n = 1) {
+      this.supplyDay = Math.max(1, this.supplyDay + Math.round(n || 0))
+      return this.supplyDay
+    },
+
+    // 一键补给：按当日净缺口（已扣除跨日结余与在途预占）就近调拨，
+    // 耐用品与消耗品分账补派；库存不足跨基地拆单，未满足缺口如实返回并继续跨日结转
     autoSupply(shelterId) {
       const cmd = this._cmd()
       const item = this.shelterNeeds.find((x) => x.shelter.id === shelterId)
       if (!item) return { ok: false, msg: '安置点不存在' }
       const gaps = Object.entries(item.gap)
-      if (!gaps.length) return { ok: false, msg: '当前无物资缺口' }
+      if (!gaps.length) return { ok: false, msg: '当前无物资缺口（结余与在途已覆盖需求）' }
       const sent = []
       const unmet = []
       gaps.forEach(([type, g]) => {
@@ -545,7 +775,8 @@ export const useTransferStore = defineStore('transfer', {
       })
       // 补给量回写关联事件时间线（该安置点服务的未办结批次所属事件）
       const evIds = [...new Set(this.batches.filter((b) => b.shelterId === shelterId && b.status !== 'closed').map((b) => b.eventId))]
-      evIds.forEach((id) => this._log(id, `📦 安置点「${item.shelter.name}」一键补给 ${sent.length} 批物资`))
+      evIds.forEach((id) => this._log(id, `📦 安置点「${item.shelter.name}」第${this.supplyDay}补给日一键补给 ${sent.length} 批物资`
+        + (unmet.length ? `，${unmet.length} 类库存不足缺口结转` : '')))
       return { ok: true, sent, unmet }
     }
   }
