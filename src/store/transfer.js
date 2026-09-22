@@ -1,19 +1,56 @@
 import { defineStore } from 'pinia'
 import { useCommandStore, roughPath, pathMetrics, dispatchParts } from '@/store/command'
 import { useRoadblockStore } from '@/store/roadblock'
-import { SHELTERS, SUPPLY_PER_CAPITA } from '@/mock/data'
+import { SHELTERS, SUPPLY_PER_CAPITA, SUPPLY_DURABLES } from '@/mock/data'
 
 let batchSeq = 0
 let personSeq = 0
 const nowStr = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const round2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100
 
 // 人员查重键：优先证件号，无证件号用姓名
 const personKey = (p) => (p.idNo && p.idNo.trim()) ? 'id:' + p.idNo.trim() : 'nm:' + (p.name || '').trim()
 
+// 时刻字符串 → 当日小时数（兼容 "09:05" / "上午9:05" / "下午3:05"）
+export function timeToHours(s) {
+  if (!s) return 0
+  const m = String(s).match(/(上午|下午|中午|晚上)?\s*(\d{1,2}):(\d{2})/)
+  if (!m) return 0
+  let h = +m[2]
+  const ap = m[1]
+  if ((ap === '下午' || ap === '晚上' || ap === '中午') && h < 12) h += 12
+  if (ap === '上午' && h === 12) h = 0
+  return Math.min(24, h + (+m[3]) / 60)
+}
+
+// 成员在第 day 日的入住时长占比（按实际入住/转出时段折算，0~1）
+// checkinDay/checkoutDay 缺失的历史记录按第 1 日兼容处理
+export function memberDayFrac(m, day) {
+  if (!m.checkinAt) return 0
+  const ciDay = m.checkinDay ?? 1
+  if (ciDay > day) return 0
+  const coDay = m.checkoutAt ? (m.checkoutDay ?? ciDay) : null
+  if (coDay != null && coDay < day) return 0
+  const start = ciDay === day ? timeToHours(m.checkinAt) : 0
+  const end = coDay === day ? timeToHours(m.checkoutAt) : 24
+  return Math.min(24, Math.max(0, end - start)) / 24
+}
+
+// 成员在第 day 日日终是否仍在住（用于在住峰值快照）
+function memberInHouseEndOf(m, day) {
+  if (!m.checkinAt) return false
+  const ciDay = m.checkinDay ?? 1
+  if (ciDay > day) return false
+  const coDay = m.checkoutAt ? (m.checkoutDay ?? ciDay) : null
+  return coDay == null || coDay > day
+}
+
 export const useTransferStore = defineStore('transfer', {
   state: () => ({
-    shelters: [],   // 安置点（床位容量）
-    batches: []     // 转移批次
+    shelters: [],   // 安置点（床位容量 + 按日补给账目：consumed 累计消耗 / settlements 日结记录 / peakInHouse 在住峰值）
+    batches: [],    // 转移批次
+    settleDay: 1,   // 当前补给结算日（第 N 日，日结后 +1）
+    clock: null     // 演示/测试用时钟覆盖（'HH:MM'），为空取真实时间
   }),
 
   getters: {
@@ -35,28 +72,69 @@ export const useTransferStore = defineStore('transfer', {
       Object.values(m).forEach((v) => { v.left = Math.max(0, v.left - v.inHouse - v.reserved) })
       return m
     },
-    /* ---------- 安置点物资需求（在住人数 × 人均系数 - 已补给） ---------- */
+    /* ---------- 安置点按日补给核算 ----------
+     * 消耗品：累计需求 = 已结日消耗(Σ 人日×系数) + 本日预计(实时人日×系数)，
+     *         结余库存 = 实收 - 已耗（跨日结转），缺口 = 累计需求 - 实收 - 在途；
+     * 耐用品：按在住峰值一次性配备（峰值 = 历史日结在住与当前在住的最大值），
+     *         不按日消耗，缺口 = 峰值需求 - 实收 - 在途；
+     * 签收/短缺/退回/撤回/人员转出均通过派发四本账与实时人日联动重算缺口；
+     * 无闭环字段的历史派发记录按全量在途计入，避免重复补给。 */
     shelterNeeds(state) {
       const cmd = useCommandStore()
+      const day = state.settleDay
       return state.shelters.map((s) => {
         const occ = this.bedMap[s.id]?.inHouse || 0
-        const need = {}
-        Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => { need[t] = Math.ceil(occ * coef) })
-        const sent = {}
+        // 本日（未结算）实时人日：按各成员实际入住时段折算
+        let todayPd = 0
+        state.batches.forEach((b) => {
+          if (b.shelterId !== s.id) return
+          b.members.forEach((m) => { todayPd += memberDayFrac(m, day) })
+        })
+        todayPd = round2(todayPd)
+        // 派发四本账（兼容无闭环字段的旧记录：dispatchParts 默认全量在途）
         const received = {}
+        const inTransit = {}
         cmd.dispatches.forEach((d) => {
           if (d.shelterId !== s.id) return
           const p = dispatchParts(d)
-          const cover = p.received + p.inTransit
-          if (cover > 0) sent[d.type] = (sent[d.type] || 0) + cover
           if (p.received > 0) received[d.type] = (received[d.type] || 0) + p.received
+          if (p.inTransit > 0) inTransit[d.type] = (inTransit[d.type] || 0) + p.inTransit
         })
+        const consumed = s.consumed || {}
+        const peak = Math.max(occ, s.peakInHouse || 0, ...(s.settlements || []).map((x) => x.inHouse), 0)
+        const consumables = {}
+        const durables = {}
+        const need = {}
         const gap = {}
-        Object.entries(need).forEach(([t, n]) => {
-          const g = n - (sent[t] || 0)
-          if (g > 0) gap[t] = g
+        Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => {
+          const rec = received[t] || 0
+          const itr = inTransit[t] || 0
+          if (SUPPLY_DURABLES.includes(t)) {
+            // 耐用品账：峰值配备，不逐日消耗
+            const nd = Math.ceil(peak * coef)
+            const g = Math.max(0, nd - rec - itr)
+            durables[t] = { coef, peak, need: nd, received: rec, inTransit: itr, gap: g }
+            need[t] = nd
+            if (g > 0) gap[t] = g
+          } else {
+            // 消耗品账：按日消耗、跨日结转
+            const used = consumed[t] || 0
+            const today = round2(todayPd * coef)
+            const cumNeed = round2(used + today)
+            const onHand = Math.max(0, round2(rec - used))
+            const g = Math.max(0, Math.ceil(cumNeed - rec - itr - 1e-9))
+            consumables[t] = { coef, today, consumed: used, onHand, received: rec, inTransit: itr, need: cumNeed, gap: g }
+            need[t] = Math.ceil(cumNeed - 1e-9)
+            if (g > 0) gap[t] = g
+          }
         })
-        return { shelter: s, occ, need, sent, received, gap }
+        // 兼容旧视图：sent = 实收 + 在途（保障量），仅保留有量条目
+        const sent = {}
+        Object.keys(SUPPLY_PER_CAPITA).forEach((t) => {
+          const v = (received[t] || 0) + (inTransit[t] || 0)
+          if (v > 0) sent[t] = v
+        })
+        return { shelter: s, day, occ, todayPd, peak, need, sent, received, gap, consumables, durables }
       })
     },
     /* ---------- 事件转移进度（回写事件详情） ---------- */
@@ -95,8 +173,10 @@ export const useTransferStore = defineStore('transfer', {
 
   actions: {
     load() {
-      this.shelters = SHELTERS.map((s) => ({ ...s }))
+      this.shelters = SHELTERS.map((s) => ({ ...s, consumed: {}, settlements: [], peakInHouse: 0 }))
       this.batches = []
+      this.settleDay = 1
+      this.clock = null
     },
 
     _cmd() { return useCommandStore() },
@@ -106,6 +186,20 @@ export const useTransferStore = defineStore('transfer', {
       if (ev) ev.timeline.push({ at: nowStr(), text })
     },
     _batch(id) { return this.batches.find((b) => b.id === id) },
+    // 当前业务时刻（测试/演示可经 setClock 覆盖）
+    _now() { return this.clock || nowStr() },
+    _shelter(id) { return this.shelters.find((s) => s.id === id) },
+    // 在住峰值跟踪：入住增长时刷新（耐用品按峰值配备，人员转出后峰值不回溯）
+    _touchPeak(shelterId) {
+      const s = this._shelter(shelterId)
+      if (!s) return
+      const inHouse = this.batches
+        .filter((b) => b.shelterId === shelterId)
+        .reduce((n, b) => n + b.members.filter((x) => x.checkinAt && !x.checkoutAt).length, 0)
+      s.peakInHouse = Math.max(s.peakInHouse || 0, inHouse)
+    },
+    // 演示/测试：固定业务时钟（null 恢复真实时间）
+    setClock(t) { this.clock = t || null },
 
     /* ---------- 道路阻断处置：挂起 / 绕行 / 续派 ---------- */
 
@@ -358,13 +452,16 @@ export const useTransferStore = defineStore('transfer', {
       if (avail < members.length) {
         return { ok: false, msg: `${this.shelters.find((s) => s.id === b.shelterId)?.name} 剩余床位 ${avail}，不足 ${members.length} 人，请改派安置点` }
       }
-      members.forEach((m) => { m.checkinAt = nowStr() })
+      const at = this._now()
+      members.forEach((m) => { m.checkinAt = at; m.checkinDay = this.settleDay })
+      this._touchPeak(b.shelterId)
       this._afterRegister(b, 'checkin', `🏕️ 入住登记 ${members.length} 人 → ${this.shelters.find((s) => s.id === b.shelterId)?.name}`)
       return { ok: true, msg: `已入住 ${members.length} 人` }
     },
 
     _checkout(b, members) {
-      members.forEach((m) => { m.checkoutAt = nowStr() })
+      const at = this._now()
+      members.forEach((m) => { m.checkoutAt = at; m.checkoutDay = this.settleDay })
       this._afterRegister(b, 'checkout', `🚪 转出登记 ${members.length} 人（返乡/投亲/转院）`)
       return { ok: true, msg: `已转出 ${members.length} 人` }
     },
@@ -414,6 +511,7 @@ export const useTransferStore = defineStore('transfer', {
       }
       from.members = from.members.filter((x) => x.id !== personId)
       to.members.push(person)
+      this._touchPeak(to.shelterId) // 已入住人员改派跨点：目标安置点在住峰值联动
       this._log(from.eventId, `🔀「${person.name}」由批次「${from.name}」改派至「${to.name}」`)
       return { ok: true, msg: `已改派至「${to.name}」` }
     },
@@ -515,15 +613,66 @@ export const useTransferStore = defineStore('transfer', {
       }
     },
 
-    /* ---------- 安置点物资联动 ---------- */
+    /* ---------- 安置点物资联动（按日补给） ---------- */
 
-    // 一键补给：按缺口就近调拨（预占式演算，直接生成补给派发记录）
+    // 日结：按实际入住时段结算本日人日与消耗品消耗，库存结余与在途物资结转至次日；
+    // 在住快照计入耐用品峰值。日结后结算日 +1，后续登记落入新一日。
+    settleShelters() {
+      const cmd = this._cmd()
+      const day = this.settleDay
+      const results = []
+      this.shelters.forEach((s) => {
+        const members = this.batches.filter((b) => b.shelterId === s.id).flatMap((b) => b.members)
+        // 本日人日：Σ 各成员当日入住时段占比
+        let personDays = 0
+        members.forEach((m) => { personDays += memberDayFrac(m, day) })
+        personDays = round2(personDays)
+        // 消耗品本日消耗入账（耐用品不耗）
+        const consumed = {}
+        Object.entries(SUPPLY_PER_CAPITA).forEach(([t, coef]) => {
+          if (SUPPLY_DURABLES.includes(t)) return
+          const c = round2(personDays * coef)
+          if (c > 0) {
+            consumed[t] = c
+            s.consumed[t] = round2((s.consumed[t] || 0) + c)
+          }
+        })
+        // 日终在住快照 → 耐用品峰值
+        const inHouse = members.filter((m) => memberInHouseEndOf(m, day)).length
+        s.peakInHouse = Math.max(s.peakInHouse || 0, inHouse)
+        // 跨日结转快照：结余库存（实收 - 累计已耗）与在途物资滚存至次日
+        const received = {}
+        const transit = {}
+        cmd.dispatches.forEach((d) => {
+          if (d.shelterId !== s.id) return
+          const p = dispatchParts(d)
+          if (p.received > 0) received[d.type] = (received[d.type] || 0) + p.received
+          if (p.inTransit > 0) transit[d.type] = (transit[d.type] || 0) + p.inTransit
+        })
+        const carry = {}
+        Object.keys(SUPPLY_PER_CAPITA).forEach((t) => {
+          if (SUPPLY_DURABLES.includes(t)) return
+          const oh = round2((received[t] || 0) - (s.consumed[t] || 0))
+          if (oh > 0) carry[t] = oh
+        })
+        const rec = { day, personDays, inHouse, consumed, carry, inTransit: transit }
+        s.settlements.push(rec)
+        results.push({ shelter: s, ...rec })
+      })
+      this.settleDay = day + 1
+      // 回写关联事件时间线（该安置点服务中的批次所属事件）
+      const evIds = [...new Set(this.batches.map((b) => b.eventId))]
+      evIds.forEach((id) => this._log(id, `🌙 安置点补给第 ${day} 日日结：消耗按实际入住时段入账，结余库存与在途物资结转至第 ${day + 1} 日`))
+      return results
+    },
+
+    // 一键补给：按当日核算缺口就近调拨（缺口已扣除实收/结余/在途，不会重复补给）
     autoSupply(shelterId) {
       const cmd = this._cmd()
       const item = this.shelterNeeds.find((x) => x.shelter.id === shelterId)
       if (!item) return { ok: false, msg: '安置点不存在' }
       const gaps = Object.entries(item.gap)
-      if (!gaps.length) return { ok: false, msg: '当前无物资缺口' }
+      if (!gaps.length) return { ok: false, msg: '当前无物资缺口（实收+在途已覆盖按日核算需求）' }
       const sent = []
       const unmet = []
       gaps.forEach(([type, g]) => {
@@ -545,7 +694,7 @@ export const useTransferStore = defineStore('transfer', {
       })
       // 补给量回写关联事件时间线（该安置点服务的未办结批次所属事件）
       const evIds = [...new Set(this.batches.filter((b) => b.shelterId === shelterId && b.status !== 'closed').map((b) => b.eventId))]
-      evIds.forEach((id) => this._log(id, `📦 安置点「${item.shelter.name}」一键补给 ${sent.length} 批物资`))
+      evIds.forEach((id) => this._log(id, `📦 安置点「${item.shelter.name}」按日补给 ${sent.length} 批物资（第 ${this.settleDay} 日缺口）`))
       return { ok: true, sent, unmet }
     }
   }

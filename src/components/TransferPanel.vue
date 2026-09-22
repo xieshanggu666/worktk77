@@ -258,6 +258,13 @@
       <div class="sh-summary">
         在住 <b>{{ transfer.stats.housed }}</b> 人 · 在途 <b>{{ transfer.stats.inTransit }}</b> 人 · 累计转出 <b>{{ transfer.stats.out }}</b> 人
       </div>
+      <!-- 按日补给：结算日 + 日结结转 -->
+      <div class="day-bar">
+        <span class="day-cur">📅 补给核算第 <b>{{ transfer.settleDay }}</b> 日</span>
+        <button class="day-settle" @click="onSettle">🌙 日结结转</button>
+      </div>
+      <p class="day-hint">按实际入住时段折算人日消耗；日结后结余库存与在途物资自动结转至次日</p>
+      <p v-if="settleMsg" class="msg ok">{{ settleMsg }}</p>
       <div v-for="item in transfer.shelterNeeds" :key="item.shelter.id" class="sh-card">
         <div class="sh-head">
           <strong>🏕️ {{ item.shelter.name }}</strong>
@@ -269,21 +276,48 @@
         </div>
         <p class="sh-sub">
           在住 {{ item.occ }} · 批次预占 {{ bedOf(item.shelter.id).reserved }} · 余 {{ bedOf(item.shelter.id).left }} 床
+          · 本日人日 {{ item.todayPd }} · 峰值 {{ item.peak }}
         </p>
-        <div class="sh-needs">
-          <template v-if="Object.keys(item.gap).length">
-            <span class="need-tag" v-for="(q, t) in item.gap" :key="t">缺 {{ resIcon(t) }}{{ resLabel(t) }} {{ q }}{{ resUnit(t) }}</span>
-          </template>
-          <span v-else class="need-ok">✅ 物资充足</span>
+
+        <!-- 消耗品账：按日消耗，跨日结转 -->
+        <div class="acct">
+          <p class="acct-title">🍚 消耗品（按日消耗 · 跨日结转）</p>
+          <div v-for="(a, t) in item.consumables" :key="t" class="acct-row">
+            <span class="a-name">{{ resIcon(t) }}{{ resLabel(t) }}</span>
+            <span>本日需 {{ a.today }}</span>
+            <span>结余 {{ a.onHand }}</span>
+            <span>在途 {{ a.inTransit }}</span>
+            <span>已耗 {{ a.consumed }}</span>
+            <span v-if="a.gap" class="a-gap">缺 {{ a.gap }}</span>
+            <span v-else class="a-ok">足</span>
+          </div>
         </div>
-        <p class="sh-sent" v-if="Object.keys(item.sent).length">
-          已保障（实收+在途）：<span v-for="(q, t) in item.sent" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
-        </p>
-        <p class="sh-recv" v-if="Object.keys(item.received).length">
-          📥 实际签收：<span v-for="(q, t) in item.received" :key="t">{{ resIcon(t) }}{{ q }}{{ resUnit(t) }} </span>
-        </p>
+
+        <!-- 耐用品账：峰值配备，不按日耗 -->
+        <div class="acct">
+          <p class="acct-title">⛺ 耐用品（峰值配备 · 不按日耗）</p>
+          <div v-for="(a, t) in item.durables" :key="t" class="acct-row">
+            <span class="a-name">{{ resIcon(t) }}{{ resLabel(t) }}</span>
+            <span>峰值需 {{ a.need }}</span>
+            <span>已收 {{ a.received }}</span>
+            <span>在途 {{ a.inTransit }}</span>
+            <span v-if="a.gap" class="a-gap">缺 {{ a.gap }}</span>
+            <span v-else class="a-ok">足</span>
+          </div>
+        </div>
+
+        <!-- 日结记录：消耗入账 + 库存/在途结转留痕 -->
+        <div v-if="item.shelter.settlements && item.shelter.settlements.length" class="settle-log">
+          <p v-for="st in item.shelter.settlements.slice(-2)" :key="st.day" class="settle-row">
+            🌙 第{{ st.day }}日：人日 {{ st.personDays }} · 日终在住 {{ st.inHouse }}
+            <template v-if="Object.keys(st.consumed).length"> · 耗 {{ fmtAcct(st.consumed) }}</template>
+            <template v-if="Object.keys(st.carry).length"> · 结转结余 {{ fmtAcct(st.carry) }}</template>
+            <template v-if="Object.keys(st.inTransit).length"> · 在途结转 {{ fmtAcct(st.inTransit) }}</template>
+          </p>
+        </div>
+
         <button class="supply-btn" :disabled="!Object.keys(item.gap).length" @click="onSupply(item.shelter.id)">
-          📦 一键补给（就近调拨）
+          📦 一键补给（按当日缺口就近调拨）
         </button>
         <p v-if="supplyMsg[item.shelter.id]" class="msg" :class="supplyMsg[item.shelter.id].ok ? 'ok' : 'err'">
           {{ supplyMsg[item.shelter.id].msg }}
@@ -313,6 +347,7 @@ const regIdNo = ref('')
 const regCount = ref(10)
 const fb = reactive({})      // 批次反馈信息 batchId -> { ok, msg, dup... }
 const supplyMsg = reactive({})
+const settleMsg = ref('')
 
 const form = ref({ name: '', headcount: 100, vehicleBaseId: '', vehicleCount: 3, shelterId: '' })
 const reForm = ref({ shelterId: '', vehicleBaseId: '', vehicleCount: 1 })
@@ -509,6 +544,15 @@ function onSupply(shelterId) {
     ? { ok: true, msg: `已生成 ${r.sent.length} 条补给派发${r.unmet.length ? `，${r.unmet.length} 类物资仍有缺口` : ''}` }
     : { ok: false, msg: r.msg }
 }
+// 日结：结算本日消耗，结余库存与在途物资结转至次日
+function onSettle() {
+  const day = transfer.settleDay
+  const rows = transfer.settleShelters()
+  const active = rows.filter((r) => r.personDays > 0 || r.inHouse > 0)
+  settleMsg.value = `第 ${day} 日已日结：${active.length ? active.map((r) => `${r.shelter.name} 人日 ${r.personDays}`).join('；') : '各安置点暂无入住'}，进入第 ${day + 1} 日`
+}
+// 账目格式化：🥫24 💧8
+const fmtAcct = (obj) => Object.entries(obj).map(([t, q]) => `${resIcon(t)}${q}${resUnit(t)}`).join(' ')
 </script>
 
 <style scoped>
@@ -681,6 +725,20 @@ function onSupply(shelterId) {
   border-radius: 8px; padding: 8px 10px; font-size: 11px; color: #8ba2c8;
 }
 .sh-summary b { color: #7ef0c9; }
+/* 按日补给：结算日栏 */
+.day-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: #101d39; border: 1px solid rgba(120,160,220,0.15);
+  border-radius: 8px; padding: 7px 10px;
+}
+.day-cur { font-size: 11px; color: #8ba2c8; }
+.day-cur b { color: #ffd54f; }
+.day-settle {
+  padding: 5px 12px; border: 1px solid rgba(255,213,79,0.45); border-radius: 6px;
+  background: rgba(255,213,79,0.1); color: #ffe082; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.day-settle:hover { background: rgba(255,213,79,0.2); }
+.day-hint { font-size: 10px; color: #5b6f94; margin: -4px 0 0; }
 .sh-card {
   background: rgba(16,29,57,0.6); border: 1px solid rgba(120,160,220,0.12);
   border-radius: 9px; padding: 9px 10px;
@@ -692,14 +750,23 @@ function onSupply(shelterId) {
 .sh-bar .in { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, #26a69a, #7ef0c9); }
 .sh-bar .rsv { position: absolute; top: 0; height: 100%; background: rgba(255,193,7,0.4); }
 .sh-sub { font-size: 10px; color: #5b6f94; margin: 5px 0 0; }
-.sh-needs { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
-.need-tag {
-  font-size: 10px; background: rgba(239,83,80,0.12); border: 1px solid rgba(239,83,80,0.35);
-  color: #ef9a9a; padding: 2px 7px; border-radius: 4px;
+/* 分账视图 */
+.acct {
+  margin-top: 7px; background: #0c1730; border: 1px solid rgba(120,160,220,0.12);
+  border-radius: 7px; padding: 6px 8px;
 }
-.need-ok { font-size: 10px; color: #7ef0c9; }
-.sh-sent { font-size: 10px; color: #8ba2c8; margin: 6px 0 0; }
-.sh-recv { font-size: 10px; color: #7ef0c9; margin: 2px 0 0; }
+.acct-title { font-size: 10px; color: #8ba2c8; font-weight: 600; margin: 0 0 4px; }
+.acct-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 10px; color: #8ba2c8; padding: 2px 0;
+}
+.acct-row + .acct-row { border-top: 1px dashed rgba(120,160,220,0.1); }
+.a-name { color: #dbe4f3; min-width: 64px; }
+.a-gap { color: #ef9a9a; font-weight: 700; }
+.a-ok { color: #7ef0c9; }
+/* 日结记录 */
+.settle-log { margin-top: 6px; border-top: 1px dashed rgba(120,160,220,0.15); padding-top: 5px; }
+.settle-row { font-size: 10px; color: #5b6f94; margin: 2px 0 0; line-height: 1.5; }
 .supply-btn {
   width: 100%; margin-top: 8px; padding: 7px; border: none; border-radius: 7px;
   background: linear-gradient(135deg, #0f5e52, #26a69a);

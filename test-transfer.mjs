@@ -7,6 +7,7 @@ const cmd = useCommandStore()
 const tr = useTransferStore()
 cmd.loadScenario('s1')
 tr.load()
+tr.setClock('00:00') // 固定业务时钟：本日入住按全日折算（原快照口径）
 
 let failed = 0
 const assert = (cond, msg) => {

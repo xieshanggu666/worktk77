@@ -57,13 +57,17 @@ export const SHELTERS = [
   { id: 'sh-5', name: '成都高新应急避难所', lng: 104.06, lat: 30.58, capacity: 1500 }
 ]
 
-// 安置点人均每日物资需求系数（按在住人数折算物资需求）
+// 安置点人均每日物资需求系数（按在住人日折算物资需求）
 export const SUPPLY_PER_CAPITA = {
   food: 0.6,    // 份/人·日（两餐+加餐折算）
   water: 0.2,   // 箱/人·日
   tent: 0.25,   // 顶/人（约 4 人一顶）
   medical: 0.05 // 件/人·日
 }
+
+// 耐用品目录：按在住峰值一次性配备、配备后留在安置点周转，不按日消耗；
+// 其余类型为消耗品，按「实际入住时段折算的人日 × 人均系数」逐日消耗、跨日结转
+export const SUPPLY_DURABLES = ['tent']
 
 // 城市坐标（作为 mock 场景锚点，实际为演示用经纬度）
 export const CITIES = {

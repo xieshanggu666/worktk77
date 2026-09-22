@@ -12,6 +12,7 @@ const rb = useRoadblockStore()
 cmd.loadScenario('s1')
 tr.load()
 rb.load()
+tr.setClock('00:00') // 固定业务时钟：本日入住按全日折算（原快照口径）
 
 let failed = 0
 const assert = (cond, msg) => {
